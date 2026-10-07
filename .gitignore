@@ -23,5 +23,4 @@ htmlcov/
 Thumbs.db
 
 # Doxygen build output
-docs/html/
-docs/latex/
+docs/_build/
