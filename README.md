@@ -46,6 +46,12 @@ uv run python
 
 runs Python directly inside the project's environment.
 
+To add a new dependency to project run:
+
+```bash
+uv add <DEPENDENCY_NAME>
+```
+
 ## Tests
 
 Run the test suite with:

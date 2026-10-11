@@ -5,12 +5,12 @@ from gaussian_processes.kernels import rbf_kernel
 
 
 def test_rbf_kernel_shape() -> None:
-    x1 = np.zeros((3,2))
-    x2 = np.zeros((5,2))
+    x1 = np.zeros((3, 2))
+    x2 = np.zeros((5, 2))
 
-    result = rbf_kernel(x1,x2)
+    result = rbf_kernel(x1, x2)
 
-    assert result.shape == (3,5)
+    assert result.shape == (3, 5)
 
 
 def test_rbf_kernel_is_symmetric() -> None:

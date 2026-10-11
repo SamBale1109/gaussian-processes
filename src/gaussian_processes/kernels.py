@@ -4,12 +4,13 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 
-def rbf_kernel(x1: ArrayLike,
-            x2: ArrayLike,
-            *,
-            length_scale: float = 1.0,
-            variance: float = 1.0,
-            )-> NDArray[np.float64]:
+def rbf_kernel(
+    x1: ArrayLike,
+    x2: ArrayLike,
+    *,
+    length_scale: float = 1.0,
+    variance: float = 1.0,
+) -> NDArray[np.float64]:
     r"""Compute the radial basis function (RBF) kernel matrix.
 
     The RBF kernel, also known as the squared exponential kernel, is
@@ -50,7 +51,7 @@ def rbf_kernel(x1: ArrayLike,
         differ, or if a kernel parameter is not positive.
     """
     if length_scale <= 0.0:
-            raise ValueError("length_scale must be positive")
+        raise ValueError("length_scale must be positive")
 
     if variance <= 0.0:
         raise ValueError("variance must be positive")
@@ -65,9 +66,9 @@ def rbf_kernel(x1: ArrayLike,
         raise ValueError("inputs must have the same number of features")
 
     diff = (
-        x1_array[:, None, :]   # (n_a, 1, d)
-        - x2_array[None, :, :]   # (1, n_b, d)
+        x1_array[:, None, :]  # (n_a, 1, d)
+        - x2_array[None, :, :]  # (1, n_b, d)
     )
-    sq_dists = np.sum(diff**2,axis=-1)
+    sq_dists = np.sum(diff**2, axis=-1)
 
-    return variance* np.exp(-sq_dists / (2.0 * length_scale**2))
+    return variance * np.exp(-sq_dists / (2.0 * length_scale**2))

@@ -5,6 +5,7 @@ description = "Educational implementation of Gaussian process regression in Pyth
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.11.2",
     "numpy>=2.5.3",
 ]
 
