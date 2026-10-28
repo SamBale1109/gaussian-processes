@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 import numpy as np
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Sequence
 from gaussian_processes.distance_gradient_fields import DistanceGradientFieldBase
+from gaussian_processes.qp import solve_qp
 
 
 # ---------------------------------------------------------------------------
@@ -241,3 +241,83 @@ class ReactiveCirculationHysteresisController:
             v_res = v_res * (self.policy.v_max / speed)
 
         return v_res
+
+
+# ---------------------------------------------------------------------------
+# CBF + QP safety-filter controller
+# ---------------------------------------------------------------------------
+class CBFQPController(Controllerbase):
+    """Safety filter that solves a control-barrier-function QP.
+
+    The robot dynamics in the testbed are ``pose_dot = u`` (velocity
+    command applied directly), i.e. affine with ``f = 0`` and
+    ``g = I``.  With the safety function ``h(x) = d(x) - d_min``
+    (``d`` the estimated distance to the nearest obstacle) the CBF
+    condition for the linear gain ``alpha(h) = gamma * h`` is
+
+        h_dot + gamma * h = grad_d^T u + gamma * (d - d_min) >= 0,
+
+    which is linear in the input ``u``.  The controller therefore
+    solves the minimum-modification QP (safety filter)
+
+        min_u  ||u - u_nom||^2
+        s.t.   grad_d^T u + gamma * (d - d_min) >= 0   (CBF)
+               -v_max <= u_i <= v_max                   (box input limits)
+
+    i.e. it tracks the nominal (goal-seeking) velocity as closely as
+    possible while keeping the set ``{d >= d_min}`` forward invariant.
+    Far from obstacles the CBF row is inactive and the nominal velocity
+    is returned unchanged.  The QP is solved with OSQP via
+    :mod:`qpsolvers` (see :mod:`gaussian_processes.qp`); if the
+    problem is infeasible (e.g. deep inside an obstacle with a flat
+    field) the nominal velocity is returned.
+    """
+
+    def __init__(
+        self,
+        policy: NominalPolicy,
+        field_model: DistanceGradientFieldBase,
+        d_min: float = 0.2,
+        gamma: float = 1.0,
+    ) -> None:
+        self.policy = policy
+        self.field_model = field_model
+        self.d_min = float(d_min)
+        self.gamma = float(gamma)
+        self.v_max = float(policy.v_max)
+
+    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
+        """CBF-QP velocity command at ``pose`` (bounded by ``v_max``)."""
+        v_nom = self.policy.compute_velocity(pose)
+        d, grad = self.field_model.query(pose)
+        g_norm = float(np.linalg.norm(grad))
+        if g_norm < 1e-9:
+            # Flat field (no nearby obstacle): no useful barrier,
+            # so just follow the nominal policy.
+            return v_nom
+
+        # Objective: ||u - v_nom||^2 = 0.5 u^T (2 I) u - (2 v_nom)^T u.
+        G = 2.0 * np.eye(2)
+        q = -2.0 * v_nom
+
+        # Constraints A u <= b.
+        # CBF: grad_d^T u + gamma*(d - d_min) >= 0
+        #      -> -grad_d^T u <= gamma*(d - d_min)
+        cbf_row = -grad
+        cbf_rhs = self.gamma * (d - self.d_min)
+        v_max = self.v_max
+        A = np.vstack([cbf_row, np.eye(2), -np.eye(2)])
+        b = np.array(
+            [cbf_rhs, v_max, v_max, v_max, v_max], dtype=float
+        )
+
+        v = solve_qp(G, q, A, b)
+        if v is None or not np.all(np.isfinite(v)):
+            # Infeasible or solver failure: fall back to the nominal.
+            return v_nom
+
+        # Final speed saturation, consistent with the other controllers.
+        speed = float(np.linalg.norm(v))
+        if speed > v_max:
+            v = v * (v_max / speed)
+        return v

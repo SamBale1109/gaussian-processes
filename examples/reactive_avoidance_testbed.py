@@ -45,7 +45,13 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle as CirclePatch
 from matplotlib.patches import Rectangle as RectanglePatch
 from gaussian_processes.distance_gradient_fields import DistanceGradientFieldBase, GPDistanceGradientField, FusedGPDistanceGradientField
-from gaussian_processes.controllers import NominalPolicy, ReactiveController, ReactiveCirculationController, ReactiveCirculationHysteresisController
+from gaussian_processes.controllers import (
+    NominalPolicy,
+    ReactiveController,
+    ReactiveCirculationController,
+    ReactiveCirculationHysteresisController,
+    CBFQPController,
+)
 
 __all__ = [
     "Obstacle",
@@ -960,7 +966,9 @@ class SimulationEngine:
 # ---------------------------------------------------------------------------
 # Demo scenario / CLI
 # ---------------------------------------------------------------------------
-def build_demo_scenario() -> Tuple[
+def build_demo_scenario(
+    controller_name: str = "circulation-hysteresis",
+) -> Tuple[
     ObstacleEnvironment,
     SensorSimulator,
     NominalPolicy,
@@ -997,7 +1005,14 @@ def build_demo_scenario() -> Tuple[
     max_sensor_range=6.0,
     max_points=300
 )
-    controller = ReactiveCirculationHysteresisController(policy, field_model,d_min=0.2,d_max=0.5)
+    if controller_name == "blended":
+        controller = ReactiveController(policy, field_model)
+    elif controller_name == "circulation":
+        controller = ReactiveCirculationController(policy, field_model)
+    elif controller_name == "cbf":
+        controller = CBFQPController(policy, field_model, d_min=0.2, gamma=1.0)
+    else:  # "circulation-hysteresis" (default)
+        controller = ReactiveCirculationHysteresisController(policy, field_model,d_min=0.2,d_max=0.5)
     return env, sensor, policy, field_model, controller
 
 
@@ -1017,9 +1032,12 @@ def run_demo(
     dt: float = 0.05,
     animate: bool = True,
     save_path: Optional[str] = None,
+    controller_name: str = "circulation-hysteresis",
 ) -> SimulationResult:
     """Set up the demo scenario, run the simulation, visualize."""
-    env, sensor, policy, field_model, controller = build_demo_scenario()
+    env, sensor, policy, field_model, controller = build_demo_scenario(
+        controller_name=controller_name,
+    )
     engine = SimulationEngine(
         env,
         sensor,
@@ -1071,12 +1089,24 @@ def main() -> None:
         metavar="PNG",
         help="save the post-simulation figure to a file",
     )
+    parser.add_argument(
+        "--controller",
+        default="circulation-hysteresis",
+        choices=[
+            "blended",
+            "circulation",
+            "circulation-hysteresis",
+            "cbf",
+        ],
+        help="reactive controller to use (default: %(default)s)",
+    )
     args = parser.parse_args()
     run_demo(
         num_steps=args.steps,
         dt=args.dt,
         animate=not args.no_anim,
         save_path=args.save_plot,
+        controller_name=args.controller,
     )
 
 
