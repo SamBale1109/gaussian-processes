@@ -44,6 +44,8 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle as CirclePatch
 from matplotlib.patches import Rectangle as RectanglePatch
+from gaussian_processes.distance_gradient_fields import DistanceGradientFieldBase, GPDistanceGradientField
+from gaussian_processes.controllers import NominalPolicy, ReactiveController, ReactiveCirculationController, ReactiveCirculationHysteresisController
 
 __all__ = [
     "Obstacle",
@@ -54,7 +56,6 @@ __all__ = [
     "ObstacleEnvironment",
     "SensorSimulator",
     "NominalPolicy",
-    "DistanceGradientFieldBase",
     "GroundTruthField",
     "ReactiveController",
     "SimulationEngine",
@@ -143,7 +144,9 @@ class CircleObstacle(Obstacle):
         t = (-b - s) / 2.0
         if t < 0.0:
             t = (-b + s) / 2.0
-        return max(t, 0.0)
+        if t < 0.0:
+            return np.inf  # Beide Schnittpunkte liegen hinter dem Strahl!
+        return t
 
     def make_patch(self) -> matplotlib.patches.Patch:
         return CirclePatch(tuple(self.center), self.radius, fill=False)
@@ -388,69 +391,11 @@ class SensorSimulator:
         return pointcloud
 
 
-# ---------------------------------------------------------------------------
-# Nominal policy
-# ---------------------------------------------------------------------------
-class NominalPolicy:
-    """Obstacle-free velocity controller that drives toward a target.
-
-    Proportional attractor with saturation::
-
-        v_nom = -v_max * (x - x_goal) / max(||x - x_goal||, r_arr)
-
-    The velocity is zero once the robot is within ``arrive_radius`` of
-    the target.
-    """
-
-    def __init__(
-        self,
-        target: Sequence[float],
-        v_max: float = 1.0,
-        arrive_radius: float = 0.15,
-    ) -> None:
-        self.target = np.asarray(target, dtype=float)
-        self.v_max = float(v_max)
-        self.arrive_radius = float(arrive_radius)
-
-    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
-        """Nominal velocity at ``pose`` (saturated to ``v_max``)."""
-        p = np.asarray(pose, dtype=float)
-        err = self.target - p
-        dist = float(np.linalg.norm(err))
-        if dist <= self.arrive_radius:
-            return np.zeros(2, dtype=float)
-        return self.v_max * err / max(dist, self.arrive_radius)
 
 
 # ---------------------------------------------------------------------------
-# Distance / gradient field interface
+# Dummy distance & gradient field
 # ---------------------------------------------------------------------------
-class DistanceGradientFieldBase(ABC):
-    """Abstract interface for distance field estimators.
-
-    Subclass this to integrate your own estimator (GP distance field,
-    IDMP, ...).  The simulation engine calls :meth:`update` once per
-    time step with the newest LiDAR measurement, and then queries the
-    field via :meth:`query`.
-    """
-
-    @abstractmethod
-    def update(self, pointcloud: np.ndarray, robot_pose: np.ndarray) -> None:
-        """Ingest a new LiDAR point cloud (shape (N, 2)).
-
-        Parameters
-        ----------
-        pointcloud:
-            Current 2D measurement points.
-        robot_pose:
-            Robot position when the measurement was taken, (2,).
-        """
-
-    @abstractmethod
-    def query(self, x: Sequence[float]) -> Tuple[float, np.ndarray]:
-        """Return ``(d(x), grad d(x))`` at a single 2D position ``x``."""
-
-
 class GroundTruthField(DistanceGradientFieldBase):
     """Dummy field that returns the *exact* environment distances.
 
@@ -467,62 +412,6 @@ class GroundTruthField(DistanceGradientFieldBase):
 
     def query(self, x: Sequence[float]) -> Tuple[float, np.ndarray]:
         return self.env.get_ground_truth_distance_and_gradient(x)
-
-
-# ---------------------------------------------------------------------------
-# Reactive controller
-# ---------------------------------------------------------------------------
-class ReactiveController:
-    """Blends the nominal velocity with a repulsive field term.
-
-    Placeholder modulation model::
-
-        v_res = w(d) * v_max * grad d / ||grad d|| + (1 - w(d)) * v_nom
-
-    where ``w(d)`` is a linear distance weight that is 1 for
-    ``d <= d_min`` (fully repulsive) and 0 for ``d >= d_max`` (fully
-    nominal).  Replace :meth:`compute_velocity` with your own
-    modulation law (e.g. projection / CBF-based) for real experiments.
-    """
-
-    def __init__(
-        self,
-        policy: NominalPolicy,
-        field_model: DistanceGradientFieldBase,
-        d_min: float = 0.4,
-        d_max: float = 1.2,
-    ) -> None:
-        self.policy = policy
-        self.field_model = field_model
-        self.d_min = float(d_min)
-        self.d_max = float(d_max)
-
-    def _weight(self, d: float) -> float:
-        """Distance-based blending weight ``w(d) in [0, 1]``."""
-        if d <= self.d_min:
-            return 1.0
-        if d >= self.d_max:
-            return 0.0
-        return (self.d_max - d) / (self.d_max - self.d_min)
-
-    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
-        """Reactive velocity command at ``pose`` (saturated to ``v_max``)."""
-        v_nom = self.policy.compute_velocity(pose)
-        d, grad = self.field_model.query(pose)
-        w = self._weight(d)
-        if w == 0.0:
-            v = v_nom
-        else:
-            g_norm = float(np.linalg.norm(grad))
-            grad_dir = grad / g_norm if g_norm > 1e-12 else np.zeros(2)
-            # grad d is a (unit) repulsive normal; scale to v_max so both
-            # terms have comparable magnitude.
-            v_rep = self.policy.v_max * grad_dir
-            v = w * v_rep + (1.0 - w) * v_nom
-        speed = float(np.linalg.norm(v))
-        if speed > self.policy.v_max:
-            v = v * (self.policy.v_max / speed)
-        return v
 
 
 # ---------------------------------------------------------------------------
@@ -1041,7 +930,7 @@ def build_demo_scenario() -> Tuple[
     SensorSimulator,
     NominalPolicy,
     GroundTruthField,
-    ReactiveController,
+    ReactiveControllerBase,
 ]:
     """Build the reference scenario (matches the skeleton in the spec).
 
@@ -1061,11 +950,12 @@ def build_demo_scenario() -> Tuple[
         )
     )
     env.add_obstacle(BoxObstacle(center=[7.5, 3.5], half_extents=[0.7, 0.4]))
-    sensor = SensorSimulator(max_range=4.0, num_rays=72, seed=42)
+    sensor = SensorSimulator(max_range=8.0, num_rays=72, seed=42)
     policy = NominalPolicy(target=[9.0, 9.0])
     # Replace with your GP-based DistanceGradientFieldBase for real runs.
-    field_model = GroundTruthField(env)
-    controller = ReactiveController(policy, field_model)
+    # field_model = GroundTruthField(env)
+    field_model = GPDistanceGradientField(length_scale=0.8, variance=1.0)
+    controller = ReactiveCirculationHysteresisController(policy, field_model,d_min=0.2,d_max=0.5)
     return env, sensor, policy, field_model, controller
 
 
