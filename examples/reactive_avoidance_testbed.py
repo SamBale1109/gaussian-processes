@@ -44,7 +44,7 @@ import numpy as np
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import Circle as CirclePatch
 from matplotlib.patches import Rectangle as RectanglePatch
-from gaussian_processes.distance_gradient_fields import DistanceGradientFieldBase, GPDistanceGradientField
+from gaussian_processes.distance_gradient_fields import DistanceGradientFieldBase, GPDistanceGradientField, FusedGPDistanceGradientField
 from gaussian_processes.controllers import NominalPolicy, ReactiveController, ReactiveCirculationController, ReactiveCirculationHysteresisController
 
 __all__ = [
@@ -636,6 +636,12 @@ class SimulationEngine:
         quiver plot.  The field is re-evaluated every
         ``field_refresh`` frames.
         """
+        # Fields that maintain internal state (e.g. the fused global map)
+        # are reset so the replay builds the map from scratch again.
+        reset = getattr(self.field_model, "reset", None)
+        if callable(reset):
+            reset()
+
         fig, ax = plt.subplots(figsize=(7.5, 7.5))
         ax.set_xlim(*self.env.bounds[0])
         ax.set_ylim(*self.env.bounds[1])
@@ -676,6 +682,15 @@ class SimulationEngine:
             patches.append(patch)
         pc_artist = ax.scatter(
             [], [], s=10, c="tab:orange", zorder=3, label="LiDAR points"
+        )
+        map_artist = ax.scatter(
+            [],
+            [],
+            s=6,
+            c="tab:cyan",
+            alpha=0.8,
+            zorder=2.5,
+            label="global map",
         )
         (traj,) = ax.plot([], [], "b-", lw=1.5, zorder=2, label="trajectory")
         (robot,) = ax.plot([], [], "k^", ms=10, zorder=5, label="robot")
@@ -729,8 +744,8 @@ class SimulationEngine:
             robot.set_data([pose[0]], [pose[1]])
             v_arrow.remove()
             v_arrow = ax.quiver(
-                pose,
-                pose + 0.0,
+                [pose[0]],
+                [pose[1]],
                 [v_cmd[0]],
                 [v_cmd[1]],
                 color="red",
@@ -762,6 +777,14 @@ class SimulationEngine:
                         zorder=1,
                     )
                 )
+            # Show the accumulated map *after* the update, so the points
+            # always match the field background of this frame.
+            map_pts = getattr(self.field_model, "X", None)
+            map_artist.set_offsets(
+                np.asarray(map_pts, dtype=float)
+                if map_pts is not None and len(map_pts) > 0
+                else np.empty((0, 2))
+            )
             info.set_text(
                 f"t = {result.times[i]:6.2f} s   "
                 f"d_true = {result.true_distances[i]:+6.3f}   "
@@ -771,6 +794,7 @@ class SimulationEngine:
                 *quivers,
                 *patches,
                 pc_artist,
+                map_artist,
                 traj,
                 robot,
                 v_arrow,
@@ -846,6 +870,17 @@ class SimulationEngine:
             scale=10.0,
         )
         self._draw_obstacles(ax_field, result.obstacle_states[-1])
+        map_pts = getattr(self.field_model, "X", None)
+        if map_pts is not None and len(map_pts) > 0:
+            ax_field.scatter(
+                map_pts[:, 0],
+                map_pts[:, 1],
+                s=6,
+                c="tab:cyan",
+                zorder=5,
+                label="global map",
+            )
+            ax_field.legend(loc="upper right", fontsize=8)
         ax_field.plot(
             [result.start_pose[0]], [result.start_pose[1]], "gs", ms=9
         )
@@ -954,7 +989,14 @@ def build_demo_scenario() -> Tuple[
     policy = NominalPolicy(target=[9.0, 9.0])
     # Replace with your GP-based DistanceGradientFieldBase for real runs.
     # field_model = GroundTruthField(env)
-    field_model = GPDistanceGradientField(length_scale=0.8, variance=1.0)
+    # field_model = GPDistanceGradientField(length_scale=0.8, variance=1.0)
+    field_model = FusedGPDistanceGradientField(
+    length_scale=0.5,
+    variance=1.0,
+    voxel_size=0.15,       # 15 cm Voxel-Raster für die Kartierungsdichte
+    max_sensor_range=6.0,
+    max_points=300
+)
     controller = ReactiveCirculationHysteresisController(policy, field_model,d_min=0.2,d_max=0.5)
     return env, sensor, policy, field_model, controller
 

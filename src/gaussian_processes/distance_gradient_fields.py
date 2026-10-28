@@ -65,6 +65,11 @@ class GPDistanceGradientField(DistanceGradientFieldBase):
         self.X: np.ndarray = np.empty((0, 2))  # Trainingspunkte (Punktwolke)
         self.alpha: np.ndarray = np.empty((0,)) # Gewichtsvektor (K_XX + sigma_o^2 I)^(-1) * 1
 
+    def reset(self) -> None:
+        """Leert das Modell (z. B. vor dem Animation-Playback)."""
+        self.X = np.empty((0, 2))
+        self.alpha = np.empty((0,))
+
     def update(self, pointcloud: np.ndarray, robot_pose: np.ndarray) -> None:
         """Nimmt eine neue Punktwolke auf und berechnet den GP-Gewichtsvektor alpha."""
         del robot_pose  # Bei einfachem Reverting-GP werden die Punkte direkt verwendet
@@ -137,248 +142,147 @@ class GPDistanceGradientField(DistanceGradientFieldBase):
         return d_hat, grad_d
 
 
+class FusedGPDistanceGradientField(DistanceGradientFieldBase):
+    """Inkrementelles Fused GP Distance and Gradient Field nach IDMP (Ali et al., 2024).
 
-
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-import numpy as np
-from typing import Dict, List, Optional, Sequence, Tuple
-from gaussian_processes.distance_gradient_fields import DistanceGradientFieldBase
-
-
-# ---------------------------------------------------------------------------
-# Nominal policy
-# ---------------------------------------------------------------------------
-class NominalPolicy:
-    """Obstacle-free velocity controller that drives toward a target.
-
-    Proportional attractor with saturation::
-
-        v_nom = -v_max * (x - x_goal) / max(||x - x_goal||, r_arr)
-
-    The velocity is zero once the robot is within ``arrive_radius`` of
-    the target.
+    Baut kontinuierlich eine globale Karte aus LiDAR-Punktwolken auf,
+    verdichtet sie über ein Voxel-Gitter und bereinigt bewegte/entfernte Hindernisse
+    über Free-Space / Ray Clearing.
     """
 
     def __init__(
         self,
-        target: Sequence[float],
-        v_max: float = 1.0,
-        arrive_radius: float = 0.15,
+        length_scale: float = 0.5,
+        variance: float = 1.0,
+        noise_variance: float = 1e-3,
+        voxel_size: float = 0.15,      # Räumliche Voxel-Auflösung der Karte (15 cm)
+        max_sensor_range: float = 6.0,  # Maximale Reichweite des LiDARs
+        max_points: int = 300,          # Bounded Size für den GP
     ) -> None:
-        self.target = np.asarray(target, dtype=float)
-        self.v_max = float(v_max)
-        self.arrive_radius = float(arrive_radius)
+        self.l = float(length_scale)
+        self.sigma2 = float(variance)
+        self.sigma2_o = float(noise_variance)
+        self.voxel_size = float(voxel_size)
+        self.max_sensor_range = float(max_sensor_range)
+        self.max_points = int(max_points)
 
-    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
-        """Nominal velocity at ``pose`` (saturated to ``v_max``)."""
-        p = np.asarray(pose, dtype=float)
-        err = self.target - p
-        dist = float(np.linalg.norm(err))
-        if dist <= self.arrive_radius:
-            return np.zeros(2, dtype=float)
-        return self.v_max * err / max(dist, self.arrive_radius)
+        # Globale Trainingspunkte des Fused Fields und Gewichtsvektor alpha
+        self.X: np.ndarray = np.empty((0, 2))
+        self.alpha: np.ndarray = np.empty((0,))
 
-class Controllerbase(ABC):
-    """Abstract interface for reactive controllers.
+    def reset(self) -> None:
+        """Leert die globale Karte und den GP-Zustand (z. B. vor dem Animation-Playback)."""
+        self.X = np.empty((0, 2))
+        self.alpha = np.empty((0,))
 
-    Subclass this to integrate your own controller (e.g. projection /
-    CBF-based).  The simulation engine calls :meth:`compute_velocity`
-    once per time step with the current robot pose.
-    """
+    def _voxel_downsample(self, points: np.ndarray) -> np.ndarray:
+        """Konsolidiert nahe beieinander liegende Punkte in einem Voxel-Raster."""
+        if len(points) == 0:
+            return points
 
-    @abstractmethod
-    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
-        """Compute a velocity command at ``pose`` (saturated to ``v_max``)."""
+        # Diskrete Voxel-Koordinaten berechnen
+        grid_coords = np.floor(points / self.voxel_size).astype(int)
+        unique_voxels, inverse_indices = np.unique(grid_coords, axis=0, return_inverse=True)
 
-# ---------------------------------------------------------------------------
-# Reactive controller
-# ---------------------------------------------------------------------------
-class ReactiveController(Controllerbase):
-    """Blends the nominal velocity with a repulsive field term.
+        downsampled = np.zeros((len(unique_voxels), 2))
+        counts = np.zeros(len(unique_voxels))
 
-    Placeholder modulation model::
+        for idx, point in zip(inverse_indices, points):
+            downsampled[idx] += point
+            counts[idx] += 1
 
-        v_res = w(d) * v_max * grad d / ||grad d|| + (1 - w(d)) * v_nom
+        return downsampled / counts[:, None]
 
-    where ``w(d)`` is a linear distance weight that is 1 for
-    ``d <= d_min`` (fully repulsive) and 0 for ``d >= d_max`` (fully
-    nominal).  Replace :meth:`compute_velocity` with your own
-    modulation law (e.g. projection / CBF-based) for real experiments.
-    """
+    def update(self, pointcloud: np.ndarray, robot_pose: np.ndarray) -> None:
+        """Inkrementelles Fused Field Update:
+        1. Ray-Clearing: Entfernt alte Kartenpunkte im Sichtbereich, wo jetzt freie Sicht ist.
+        2. Fusion: Zusammenführung neuer LiDAR-Messungen mit der bestehenden Karte.
+        3. Voxel-Downsampling & Berechnung des GP-Gewichtsvektors alpha.
+        """
+        robot_pose = np.asarray(robot_pose, dtype=float)
 
-    def __init__(
-        self,
-        policy: NominalPolicy,
-        field_model: DistanceGradientFieldBase,
-        d_min: float = 0.4,
-        d_max: float = 1.2,
-    ) -> None:
-        self.policy = policy
-        self.field_model = field_model
-        self.d_min = float(d_min)
-        self.d_max = float(d_max)
+        # 1. Free-Space / Ray Clearing (für dynamische Hindernisse)
+        if len(self.X) > 0 and len(pointcloud) > 0:
+            vecs_to_map = self.X - robot_pose
+            dists_to_map = np.linalg.norm(vecs_to_map, axis=1)
 
-    def _weight(self, d: float) -> float:
-        """Distance-based blending weight ``w(d) in [0, 1]``."""
-        if d <= self.d_min:
-            return 1.0
-        if d >= self.d_max:
-            return 0.0
-        return (self.d_max - d) / (self.d_max - self.d_min)
+            # Nur Punkte im aktuellen Sensor-Sichtbereich betrachten
+            in_frustum_mask = dists_to_map <= (self.max_sensor_range - 0.2)
+            keep_mask = np.ones(len(self.X), dtype=bool)
 
-    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
-        """Reactive velocity command at ``pose`` (saturated to ``v_max``)."""
-        v_nom = self.policy.compute_velocity(pose)
-        d, grad = self.field_model.query(pose)
-        w = self._weight(d)
-        if w == 0.0:
-            v = v_nom
-        else:
-            g_norm = float(np.linalg.norm(grad))
-            grad_dir = grad / g_norm if g_norm > 1e-12 else np.zeros(2)
-            # grad d is a (unit) repulsive normal; scale to v_max so both
-            # terms have comparable magnitude.
-            v_rep = self.policy.v_max * grad_dir
-            v = w * v_rep + (1.0 - w) * v_nom
-        speed = float(np.linalg.norm(v))
-        if speed > self.policy.v_max:
-            v = v * (self.policy.v_max / speed)
-        return v
+            pc_vecs = pointcloud - robot_pose
+            pc_dists = np.linalg.norm(pc_vecs, axis=1)
+            pc_dirs = pc_vecs / (pc_dists[:, None] + 1e-9)
 
+            for i, map_pt in enumerate(self.X):
+                if not in_frustum_mask[i]:
+                    continue
 
-# ---------------------------------------------------------------------------
-# Reactive controller
-# ---------------------------------------------------------------------------
-class ReactiveCirculationController(Controllerbase):
-    """Blends the nominal velocity with a repulsive field term.
+                map_dist = dists_to_map[i]
+                map_dir = vecs_to_map[i] / (map_dist + 1e-9)
 
-    Placeholder modulation model::
+                # Prüfen, ob ein aktueller LiDAR-Strahl in gleicher Richtung weiter fliegt als der alte Punkt
+                cos_sims = np.dot(pc_dirs, map_dir)
+                best_match_idx = np.argmax(cos_sims)
 
-        v_res = w(d) * v_max * grad d / ||grad d|| + (1 - w(d)) * v_nom
+                if cos_sims[best_match_idx] > 0.98 and pc_dists[best_match_idx] > map_dist + 0.3:
+                    keep_mask[i] = False  # Alter Punkt wird gelöscht (Hindernis existiert nicht mehr)
 
-    where ``w(d)`` is a linear distance weight that is 1 for
-    ``d <= d_min`` (fully repulsive) and 0 for ``d >= d_max`` (fully
-    nominal).  Replace :meth:`compute_velocity` with your own
-    modulation law (e.g. projection / CBF-based) for real experiments.
-    """
+            self.X = self.X[keep_mask]
 
-    def __init__(
-        self,
-        policy: NominalPolicy,
-        field_model: DistanceGradientFieldBase,
-        d_min: float = 0.4,
-        d_max: float = 1.2,
-    ) -> None:
-        self.policy = policy
-        self.field_model = field_model
-        self.d_min = float(d_min)
-        self.d_max = float(d_max)
-
-    def _weight(self, d: float) -> float:
-        """Distance-based blending weight ``w(d) in [0, 1]``."""
-        if d <= self.d_min:
-            return 1.0
-        if d >= self.d_max:
-            return 0.0
-        return (self.d_max - d) / (self.d_max - self.d_min)
-
-    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
-        """Reactive velocity command at ``pose`` (saturated to ``v_max``)."""
-        v_nom = self.policy.compute_velocity(pose)
-        d, grad = self.field_model.query(pose)
-        w = self._weight(d)
-        if w == 0.0:
-            v = v_nom
-        else:
-            g_norm = float(np.linalg.norm(grad))
-            grad_dir = grad / g_norm if g_norm > 1e-12 else np.zeros(2)
-
-            # tangential direction left:
-            tan_dir_left = np.array([-grad_dir[1], grad_dir[0]])
-
-            # choose left or right based on the angle to the nominal velocity
-            if np.dot(tan_dir_left, v_nom) >= 0:
-                tan_dir = tan_dir_left
+        # 2. Fusion: Neue Punkte zur Karte hinzufügen
+        if len(pointcloud) > 0:
+            if len(self.X) == 0:
+                combined_pts = pointcloud
             else:
-                tan_dir = -tan_dir_left
+                combined_pts = np.vstack([self.X, pointcloud])
 
-            # grad d is a (unit) repulsive normal; scale to v_max so both
-            # terms have comparable magnitude.
-            v_rep = self.policy.v_max * grad_dir
-            v_tan = self.policy.v_max * tan_dir
-            # Nahe am Hindernis dominiert die Zirkulation (z. B. 70% t + 30% n)
-            v_avoid = 0.3 * v_rep + 0.7 * v_tan
-            # Endgültige Geschwindigkeitsmischung mit der Ziel-Policy
-            v = (1.0 - w) * v_nom + w * v_avoid
-        speed = float(np.linalg.norm(v))
-        if speed > self.policy.v_max:
-            v = v * (self.policy.v_max / speed)
-        return v
+            # Voxel Downsampling durchführen
+            self.X = self._voxel_downsample(combined_pts)
 
+        # 3. Maximalanzahl Punkte begrenzen (Punkte nahe am Roboter priorisieren)
+        if len(self.X) > self.max_points:
+            dists = np.linalg.norm(self.X - robot_pose, axis=1)
+            sorted_indices = np.argsort(dists)
+            self.X = self.X[sorted_indices[:self.max_points]]
 
-class ReactiveCirculationHysteresisController:
-    def __init__(
-        self,
-        policy,
-        field_model,
-        d_min: float = 0.2,
-        d_max: float = 1.0,
-    ) -> None:
-        self.policy = policy
-        self.field_model = field_model
-        self.d_min = float(d_min)
-        self.d_max = float(d_max)
+        if len(self.X) == 0:
+            self.alpha = np.empty((0,))
+            return
 
-        # Hysterese-Zustand: None = freie Fahrt, +1 = linksherum, -1 = rechtsherum
-        self.circ_direction = None
+        # 4. GP-Gewichtsvektor alpha für das akkumulierte Fused Field berechnen
+        N = len(self.X)
+        K_XX = rbf_kernel(self.X, self.X, length_scale=self.l, variance=self.sigma2)
+        A = K_XX + self.sigma2_o * np.eye(N)
+        ones = np.ones(N)
 
-    def _weight(self, d: float) -> float:
-        if d <= self.d_min:
-            return 1.0
-        if d >= self.d_max:
-            return 0.0
-        return (self.d_max - d) / (self.d_max - self.d_min)
+        try:
+            L = np.linalg.cholesky(A)
+            self.alpha = np.linalg.solve(L.T, np.linalg.solve(L, ones))
+        except np.linalg.LinAlgError:
+            self.alpha = np.linalg.solve(A, ones)
 
-    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
-        v_nom = self.policy.compute_velocity(pose)
-        d, grad = self.field_model.query(pose)
-        g_norm = float(np.linalg.norm(grad))
+    def query(self, x: Sequence[float]) -> Tuple[float, np.ndarray]:
+        """Liest Distanz und Gradienten aus dem globalen Fused Field aus."""
+        if len(self.X) == 0:
+            return 10.0, np.zeros(2)
 
-        # 1. Wenn der Abstand wieder groß genug ist, Zustand zurücksetzen
-        if g_norm < 1e-12 or d >= self.d_max:
-            self.circ_direction = None  # Speicher löschen für das nächste Hindernis
-            return v_nom
+        x_query = np.asarray(x, dtype=float)
+        diff = x_query - self.X
 
-        # Normalenvektor n (vom Hindernis weg)
-        n = grad / g_norm
+        k_xX = rbf_kernel(x_query[None, :], self.X, length_scale=self.l, variance=self.sigma2)[0]
+        o_hat = float(np.dot(k_xX, self.alpha))
 
-        # Basis-Tangentialvektor t_left (90° nach links gedreht)
-        t_left = np.array([-n[1], n[0]])
+        o_clipped = np.clip(o_hat, 1e-8, self.sigma2)
+        d_hat = float(np.sqrt(-2.0 * (self.l**2) * np.log(o_clipped / self.sigma2)))
 
-        # 2. Richtungsentscheidung NUR TREFFEN, WENN DIESES HINDERNIS NEU IST
-        if self.circ_direction is None:
-            if np.dot(v_nom, t_left) >= 0:
-                self.circ_direction = 1.0   # Links vorbeisteuern
-                print("set circulation direction to left")
-            else:
-                self.circ_direction = -1.0  # Rechts vorbeisteuern
-                print("set circulation direction to right")
+        grad_k = -(diff / (self.l**2)) * k_xX[:, None]
+        grad_o = np.dot(self.alpha, grad_k)
 
-        # 3. Den einmal gewählten Tangentialvektor beibehalten
-        t = t_left * self.circ_direction
+        grad_o_norm = np.linalg.norm(grad_o)
+        if grad_o_norm > 1e-12:
+            grad_d = -grad_o / grad_o_norm
+        else:
+            grad_d = np.zeros(2)
 
-        # 4. Vektormischung durchführen
-        w = self._weight(d)
-        v_rep = self.policy.v_max * n
-        v_circ = self.policy.v_max * t
-
-        v_avoid = 0.3 * v_rep + 0.7 * v_circ
-        v_res = (1.0 - w) * v_nom + w * v_avoid
-
-        # Sättigung auf v_max
-        speed = float(np.linalg.norm(v_res))
-        if speed > self.policy.v_max:
-            v_res = v_res * (self.policy.v_max / speed)
-
-        return v_res
+        return d_hat, grad_d
