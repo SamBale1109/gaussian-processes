@@ -16,6 +16,7 @@ Components
 - :class:`DistanceGradientFieldBase`  field estimator interface (ABC)
 - :class:`GroundTruthField`       dummy field using the exact distances
 - :class:`ReactiveController`     velocity blending / modulation
+- :class:`ResidualRLController`   base policy + learned PPO residual
 - :class:`SimulationEngine`       Euler integration loop + logging
 - :func:`run_demo` / ``__main__`` ready-to-run demo scenario
 
@@ -26,11 +27,28 @@ Usage::
     python examples/reactive_avoidance_testbed.py            # live anim
     python examples/reactive_avoidance_testbed.py --no-anim  # static plot
     python examples/reactive_avoidance_testbed.py --save-plot out.png
+
+Custom scenarios: create a world with the interactive editor
+(``examples/create_environment.py``) and load it with
+``--scenario``::
+
+    python examples/create_environment.py
+    python examples/reactive_avoidance_testbed.py \
+        --scenario custom_environment.json
+
+Residual RL policy (train it first with
+``examples/train_residual_rl.py``, needs the ``rl`` dependency
+group)::
+
+    uv run --group rl python examples/reactive_avoidance_testbed.py \
+        --controller residual_rl \
+        --rl-model runs/residual_rl_main/model.zip
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -47,10 +65,14 @@ from matplotlib.patches import Rectangle as RectanglePatch
 from gaussian_processes.distance_gradient_fields import DistanceGradientFieldBase, GPDistanceGradientField, FusedGPDistanceGradientField
 from gaussian_processes.controllers import (
     NominalPolicy,
+    Controllerbase,
     ReactiveController,
     ReactiveCirculationController,
     ReactiveCirculationHysteresisController,
     CBFQPController,
+    MPCController,
+    RMPController,
+    CirculationGuidance,
 )
 
 __all__ = [
@@ -64,8 +86,10 @@ __all__ = [
     "NominalPolicy",
     "GroundTruthField",
     "ReactiveController",
+    "ResidualRLController",
     "SimulationEngine",
     "SimulationResult",
+    "load_scenario",
     "run_demo",
 ]
 
@@ -418,6 +442,74 @@ class GroundTruthField(DistanceGradientFieldBase):
 
     def query(self, x: Sequence[float]) -> Tuple[float, np.ndarray]:
         return self.env.get_ground_truth_distance_and_gradient(x)
+
+
+# ---------------------------------------------------------------------------
+# Residual RL controller
+# ---------------------------------------------------------------------------
+class ResidualRLController(Controllerbase):
+    """Goal attraction (base) + learned residual (saved PPO model).
+
+    Wraps a model trained with ``train_residual_rl.py``: every step the
+    nominal velocity ``v_nom`` is computed, the saved policy maps the
+    shared observation (see ``residual_rl_env.build_observation`` --
+    the exact features the model was trained on) to a residual
+    ``d_v = v_max * action``, and the executed velocity is
+    ``v_nom + d_v`` saturated to ``v_max``.
+
+    The model expects the default base-policy parameters
+    (``v_max = 1.0``, ``arrive_radius = 0.15``) and a world scale of
+    10 (the scenario/world side length).  No field model is used; the
+    engine still queries one for logging, so pass a
+    :class:`GroundTruthField`.  Note that the engine updates moving
+    obstacles *before* the velocity command, whereas during training
+    the command was issued before the obstacle update -- a one-step
+    difference that only matters for fast movers.
+    """
+
+    def __init__(
+        self,
+        env: ObstacleEnvironment,
+        policy: NominalPolicy,
+        model_path: str,
+    ) -> None:
+        from stable_baselines3 import PPO
+
+        # When this file runs as a script (``python
+        # reactive_avoidance_testbed.py``) it lives under the name
+        # ``__main__``; alias it so ``residual_rl_env``'s
+        # ``from reactive_avoidance_testbed import ...`` reuses this
+        # module instead of importing the file a second time (which
+        # would duplicate the obstacle classes and break isinstance
+        # checks inside the observation builder).
+        sys.modules.setdefault("reactive_avoidance_testbed",
+                               sys.modules[__name__])
+        import residual_rl_env
+
+        self.env = env
+        self.policy = policy
+        self.model = PPO.load(model_path)
+        self.cfg = residual_rl_env.ResidualConfig()
+        self._build_obs = residual_rl_env.build_observation
+        self.v_max = float(policy.v_max)
+        lo = np.asarray(env.lo, dtype=float)
+        hi = np.asarray(env.hi, dtype=float)
+        self.scale = float(max(hi[0] - lo[0], hi[1] - lo[1]))
+
+    def compute_velocity(self, pose: Sequence[float]) -> np.ndarray:
+        p = np.asarray(pose, dtype=float)
+        v_nom = self.policy.compute_velocity(p)
+        obs = self._build_obs(
+            self.env, p, np.asarray(self.policy.target, dtype=float),
+            self.env.lo, self.env.hi, self.scale, v_nom, self.cfg,
+        )
+        action, _ = self.model.predict(obs, deterministic=True)
+        d_v = self.v_max * np.asarray(action, dtype=float).reshape(2)
+        v = v_nom + d_v
+        n = float(np.linalg.norm(v))
+        if n > self.v_max:
+            v = v * (self.v_max / n)
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -964,18 +1056,76 @@ class SimulationEngine:
 
 
 # ---------------------------------------------------------------------------
+# Scenario loading
+# ---------------------------------------------------------------------------
+def load_scenario(
+    path: str,
+) -> Tuple[ObstacleEnvironment, np.ndarray, np.ndarray]:
+    """Load a scenario (env, start pose, goal) from a JSON file.
+
+    The file format is written by ``create_environment.py``: world
+    bounds, a start pose, a goal, and a list of circle / box obstacles
+    (an optional ``"velocity"`` field makes an obstacle move).
+    """
+    with open(path) as fh:
+        data = json.load(fh)
+    bounds = data.get("bounds", [[0.0, 10.0], [0.0, 10.0]])
+    env = ObstacleEnvironment(
+        bounds=(
+            (float(bounds[0][0]), float(bounds[0][1])),
+            (float(bounds[1][0]), float(bounds[1][1])),
+        )
+    )
+    for entry in data["obstacles"]:
+        if entry["type"] == "circle":
+            env.add_obstacle(
+                CircleObstacle(
+                    center=entry["center"],
+                    radius=entry["radius"],
+                    velocity=entry.get("velocity"),
+                )
+            )
+        elif entry["type"] == "box":
+            env.add_obstacle(
+                BoxObstacle(
+                    center=entry["center"],
+                    half_extents=entry["half_extents"],
+                    velocity=entry.get("velocity"),
+                )
+            )
+        else:
+            raise ValueError(f"unknown obstacle type: {entry['type']}")
+    return (
+        env,
+        np.asarray(data["start"], dtype=float),
+        np.asarray(data["goal"], dtype=float),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Demo scenario / CLI
 # ---------------------------------------------------------------------------
 def build_demo_scenario(
     controller_name: str = "circulation-hysteresis",
+    env: Optional[ObstacleEnvironment] = None,
+    policy_target: Optional[Sequence[float]] = None,
+    dt: float = 0.05,
+    rl_model: Optional[str] = None,
 ) -> Tuple[
     ObstacleEnvironment,
     SensorSimulator,
     NominalPolicy,
-    GroundTruthField,
-    ReactiveControllerBase,
+    DistanceGradientFieldBase,
+    Controllerbase,
 ]:
     """Build the reference scenario (matches the skeleton in the spec).
+
+    ``env`` and ``policy_target`` override the demo world and the
+    nominal target (e.g. from ``load_scenario``); when ``env`` is
+    given, ``policy_target`` should be that scenario's goal.  ``dt`` is
+    the integration step, used by the model-predictive controller.
+    ``rl_model`` is the path to a saved PPO ``model.zip`` and is
+    required for ``controller_name="residual_rl"``.
 
     Note: the static circle is offset from the exact [5, 5] start-goal
     symmetry line.  With the simple repulsive-vector placeholder, a
@@ -985,32 +1135,68 @@ def build_demo_scenario(
     around the circle.  Your own modulation layer can be expected to
     handle the exact-collision case.
     """
-    env = ObstacleEnvironment()
-    env.add_obstacle(CircleObstacle(center=[4.8, 5.2], radius=1.0))
-    env.add_obstacle(
-        MovingCircleObstacle(
-            initial_center=[3.0, 7.0], velocity=[0.1, -0.05], radius=0.8
+    if env is None:
+        env = ObstacleEnvironment()
+        env.add_obstacle(CircleObstacle(center=[4.8, 5.2], radius=1.0))
+        env.add_obstacle(
+            MovingCircleObstacle(
+                initial_center=[3.0, 7.0], velocity=[0.1, -0.05], radius=0.8
+            )
         )
-    )
-    env.add_obstacle(BoxObstacle(center=[7.5, 3.5], half_extents=[0.7, 0.4]))
+        env.add_obstacle(
+            BoxObstacle(center=[7.5, 3.5], half_extents=[0.7, 0.4])
+        )
     sensor = SensorSimulator(max_range=8.0, num_rays=72, seed=42)
-    policy = NominalPolicy(target=[9.0, 9.0])
+    if policy_target is None:
+        policy_target = [9.0, 9.0]
+    policy = NominalPolicy(target=policy_target)
     # Replace with your GP-based DistanceGradientFieldBase for real runs.
     # field_model = GroundTruthField(env)
     # field_model = GPDistanceGradientField(length_scale=0.8, variance=1.0)
-    field_model = FusedGPDistanceGradientField(
-    length_scale=0.5,
-    variance=1.0,
-    voxel_size=0.15,       # 15 cm Voxel-Raster für die Kartierungsdichte
-    max_sensor_range=6.0,
-    max_points=300
-)
+    if controller_name == "residual_rl":
+        # The learned policy needs no field model, but the engine
+        # queries one every step for logging: use exact ground truth.
+        field_model = GroundTruthField(env)
+    else:
+        field_model = FusedGPDistanceGradientField(
+            length_scale=0.5,
+            variance=1.0,
+            # 15 cm Voxel-Raster für die Kartierungsdichte
+            voxel_size=0.15,
+            max_sensor_range=6.0,
+            max_points=300
+        )
     if controller_name == "blended":
         controller = ReactiveController(policy, field_model)
     elif controller_name == "circulation":
         controller = ReactiveCirculationController(policy, field_model)
     elif controller_name == "cbf":
         controller = CBFQPController(policy, field_model, d_min=0.2, gamma=1.0)
+    elif controller_name == "cbf-circ":
+        controller = CBFQPController(
+            policy, field_model, d_min=0.2, gamma=1.0,
+            circulation=CirculationGuidance(d_min=0.2, d_max=0.8),
+        )
+    elif controller_name == "mpc":
+        controller = MPCController(policy, field_model, dt=dt, d_min=0.2)
+    elif controller_name == "mpc-circ":
+        controller = MPCController(
+            policy, field_model, dt=dt, d_min=0.2,
+            circulation=CirculationGuidance(d_min=0.2, d_max=0.8),
+        )
+    elif controller_name == "rmp":
+        controller = RMPController(policy, field_model, d_min=0.2)
+    elif controller_name == "rmp-circ":
+        controller = RMPController(
+            policy, field_model, d_min=0.2, circulation=True,
+        )
+    elif controller_name == "residual_rl":
+        if rl_model is None:
+            raise ValueError(
+                "controller 'residual_rl' requires a saved model.zip "
+                "(--rl-model, see train_residual_rl.py)"
+            )
+        controller = ResidualRLController(env, policy, rl_model)
     else:  # "circulation-hysteresis" (default)
         controller = ReactiveCirculationHysteresisController(policy, field_model,d_min=0.2,d_max=0.5)
     return env, sensor, policy, field_model, controller
@@ -1033,17 +1219,38 @@ def run_demo(
     animate: bool = True,
     save_path: Optional[str] = None,
     controller_name: str = "circulation-hysteresis",
+    scenario_path: Optional[str] = None,
+    rl_model: Optional[str] = None,
 ) -> SimulationResult:
-    """Set up the demo scenario, run the simulation, visualize."""
-    env, sensor, policy, field_model, controller = build_demo_scenario(
-        controller_name=controller_name,
-    )
+    """Set up the demo scenario, run the simulation, visualize.
+
+    ``scenario_path`` loads the world, start pose, and goal from a
+    JSON scenario file (created with ``create_environment.py``).
+    ``rl_model`` is the saved PPO ``model.zip`` for the
+    ``residual_rl`` controller.
+    """
+    if scenario_path is not None:
+        env, start_pose, goal = load_scenario(scenario_path)
+        _, sensor, _, field_model, controller = build_demo_scenario(
+            controller_name=controller_name,
+            env=env,
+            policy_target=goal,
+            dt=dt,
+            rl_model=rl_model,
+        )
+    else:
+        env, sensor, _, field_model, controller = build_demo_scenario(
+            controller_name=controller_name,
+            dt=dt,
+            rl_model=rl_model,
+        )
+        start_pose = [1.0, 1.0]
     engine = SimulationEngine(
         env,
         sensor,
         field_model,
         controller,
-        start_pose=[1.0, 1.0],
+        start_pose=start_pose,
         dt=dt,
         num_steps=num_steps,
     )
@@ -1097,8 +1304,28 @@ def main() -> None:
             "circulation",
             "circulation-hysteresis",
             "cbf",
+            "cbf-circ",
+            "mpc",
+            "mpc-circ",
+            "rmp",
+            "rmp-circ",
+            "residual_rl",
         ],
         help="reactive controller to use (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--rl-model",
+        default=None,
+        metavar="ZIP",
+        help="saved PPO model.zip for --controller residual_rl "
+        "(trained with examples/train_residual_rl.py)",
+    )
+    parser.add_argument(
+        "--scenario",
+        default=None,
+        metavar="JSON",
+        help="load world, start and goal from a scenario JSON file "
+        "(created with examples/create_environment.py)",
     )
     args = parser.parse_args()
     run_demo(
@@ -1107,6 +1334,8 @@ def main() -> None:
         animate=not args.no_anim,
         save_path=args.save_plot,
         controller_name=args.controller,
+        scenario_path=args.scenario,
+        rl_model=args.rl_model,
     )
 
 

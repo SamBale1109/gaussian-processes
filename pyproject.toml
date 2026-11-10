@@ -19,6 +19,13 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.10",
 ]
+# Optional residual-RL experiment (examples/train_residual_rl.py).
+# Not installed by default: `uv sync --group rl`, run via
+# `uv run --group rl python examples/train_residual_rl.py`.
+rl = [
+    "gymnasium>=1.0",
+    "stable-baselines3>=2.6",
+]
 
 [tool.ruff]
 line-length = 79

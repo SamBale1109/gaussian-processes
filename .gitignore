@@ -24,3 +24,6 @@ Thumbs.db
 
 # Doxygen build output
 docs/_build/
+
+# RL training output (models / eval summaries)
+runs/
